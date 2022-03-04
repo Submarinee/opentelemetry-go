@@ -17,13 +17,12 @@ package otlptracehttp_test
 import (
 	"context"
 	"log"
-
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -44,7 +43,6 @@ func add(ctx context.Context, x, y int64) int64 {
 	var span trace.Span
 	_, span = tracer.Start(ctx, "Addition")
 	defer span.End()
-
 	return x + y
 }
 
