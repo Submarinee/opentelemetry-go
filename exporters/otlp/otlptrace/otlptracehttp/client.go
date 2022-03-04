@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package otlptracehttp
+package otlptracehttp // import "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 
 import (
 	"bytes"
@@ -23,21 +23,18 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
-	"path"
+	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
-	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
-
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/internal/otlpconfig"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/internal/retry"
-
 	"google.golang.org/protobuf/proto"
 
+	"go.opentelemetry.io/otel/exporters/otlp/internal/retry"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/internal/otlpconfig"
 	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
 const contentTypeProto = "application/x-protobuf"
@@ -73,32 +70,14 @@ type client struct {
 	requestFunc retry.RequestFunc
 	client      *http.Client
 	stopCh      chan struct{}
+	stopOnce    sync.Once
 }
 
 var _ otlptrace.Client = (*client)(nil)
 
 // NewClient creates a new HTTP trace client.
 func NewClient(opts ...Option) otlptrace.Client {
-	cfg := otlpconfig.NewDefaultConfig()
-	otlpconfig.ApplyHTTPEnvConfigs(&cfg)
-	for _, opt := range opts {
-		opt.applyHTTPOption(&cfg)
-	}
-
-	for pathPtr, defaultPath := range map[*string]string{
-		&cfg.Traces.URLPath: otlpconfig.DefaultTracesPath,
-	} {
-		tmp := strings.TrimSpace(*pathPtr)
-		if tmp == "" {
-			tmp = defaultPath
-		} else {
-			tmp = path.Clean(tmp)
-			if !path.IsAbs(tmp) {
-				tmp = fmt.Sprintf("/%s", tmp)
-			}
-		}
-		*pathPtr = tmp
-	}
+	cfg := otlpconfig.NewHTTPConfig(asHTTPOptions(opts)...)
 
 	httpClient := &http.Client{
 		Transport: ourTransport,
@@ -134,7 +113,9 @@ func (d *client) Start(ctx context.Context) error {
 
 // Stop shuts down the client and interrupt any in-flight request.
 func (d *client) Stop(ctx context.Context) error {
-	close(d.stopCh)
+	d.stopOnce.Do(func() {
+		close(d.stopCh)
+	})
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -200,8 +181,8 @@ func (d *client) UploadTraces(ctx context.Context, protoSpans []*tracepb.Resourc
 }
 
 func (d *client) newRequest(body []byte) (request, error) {
-	address := fmt.Sprintf("%s://%s%s", d.getScheme(), d.cfg.Endpoint, d.cfg.URLPath)
-	r, err := http.NewRequest(http.MethodPost, address, nil)
+	u := url.URL{Scheme: d.getScheme(), Host: d.cfg.Endpoint, Path: d.cfg.URLPath}
+	r, err := http.NewRequest(http.MethodPost, u.String(), nil)
 	if err != nil {
 		return request{Request: r}, err
 	}
@@ -239,6 +220,19 @@ func (d *client) newRequest(body []byte) (request, error) {
 	}
 
 	return req, nil
+}
+
+// MarshalLog is the marshaling function used by the logging system to represent this Client.
+func (d *client) MarshalLog() interface{} {
+	return struct {
+		Type     string
+		Endpoint string
+		Insecure bool
+	}{
+		Type:     "otlphttphttp",
+		Endpoint: d.cfg.Endpoint,
+		Insecure: d.cfg.Insecure,
+	}
 }
 
 // bodyReader returns a closure returning a new reader for buf.

@@ -31,7 +31,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	ottest "go.opentelemetry.io/otel/internal/internaltest"
 	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
 )
 
 var (
@@ -203,6 +203,17 @@ func TestMerge(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEmpty(t *testing.T) {
+	var res *resource.Resource
+	assert.Equal(t, "", res.SchemaURL())
+	assert.Equal(t, "", res.String())
+	assert.Equal(t, []attribute.KeyValue(nil), res.Attributes())
+
+	it := res.Iter()
+	assert.Equal(t, 0, it.Len())
+	assert.True(t, res.Equal(res))
 }
 
 func TestDefault(t *testing.T) {
@@ -637,4 +648,75 @@ func hostname() string {
 		return fmt.Sprintf("hostname(%s)", err)
 	}
 	return hn
+}
+
+func TestWithContainerID(t *testing.T) {
+	t.Cleanup(restoreAttributesProviders)
+
+	fakeContainerID := "fake-container-id"
+
+	testCases := []struct {
+		name                string
+		containerIDProvider func() (string, error)
+		expectedResource    map[string]string
+		expectedErr         bool
+	}{
+		{
+			name: "get container id",
+			containerIDProvider: func() (string, error) {
+				return fakeContainerID, nil
+			},
+			expectedResource: map[string]string{
+				string(semconv.ContainerIDKey): fakeContainerID,
+			},
+		},
+		{
+			name: "no container id found",
+			containerIDProvider: func() (string, error) {
+				return "", nil
+			},
+			expectedResource: map[string]string{},
+		},
+		{
+			name: "error",
+			containerIDProvider: func() (string, error) {
+				return "", fmt.Errorf("unable to get container id")
+			},
+			expectedResource: map[string]string{},
+			expectedErr:      true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resource.SetContainerProviders(tc.containerIDProvider)
+
+			res, err := resource.New(context.Background(),
+				resource.WithContainerID(),
+			)
+
+			if tc.expectedErr {
+				assert.Error(t, err)
+			}
+			assert.Equal(t, tc.expectedResource, toMap(res))
+		})
+	}
+}
+
+func TestWithContainer(t *testing.T) {
+	t.Cleanup(restoreAttributesProviders)
+
+	fakeContainerID := "fake-container-id"
+	resource.SetContainerProviders(func() (string, error) {
+		return fakeContainerID, nil
+	})
+
+	res, err := resource.New(context.Background(),
+		resource.WithContainer(),
+	)
+
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]string{
+		string(semconv.ContainerIDKey): fakeContainerID,
+	}, toMap(res))
 }

@@ -26,20 +26,18 @@ import (
 	"testing"
 	"time"
 
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
-	"go.opentelemetry.io/otel/trace"
-
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	ottest "go.opentelemetry.io/otel/internal/internaltest"
-
 	"go.opentelemetry.io/otel/sdk/instrumentation"
 	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const envVar = "OTEL_RESOURCE_ATTRIBUTES"
@@ -195,7 +193,7 @@ func TestSetName(t *testing.T) {
 		},
 	} {
 		sp := startNamedSpan(tp, "SetName", tt.name)
-		if sdkspan, ok := sp.(*span); ok {
+		if sdkspan, ok := sp.(*recordingSpan); ok {
 			if sdkspan.Name() != tt.name {
 				t.Errorf("%d: invalid name at span creation, expected %v, got %v", idx, tt.name, sdkspan.Name())
 			}
@@ -203,7 +201,7 @@ func TestSetName(t *testing.T) {
 			t.Errorf("%d: unable to coerce span to SDK span, is type %T", idx, sp)
 		}
 		sp.SetName(tt.newName)
-		if sdkspan, ok := sp.(*span); ok {
+		if sdkspan, ok := sp.(*recordingSpan); ok {
 			if sdkspan.Name() != tt.newName {
 				t.Errorf("%d: span name not changed, expected %v, got %v", idx, tt.newName, sdkspan.Name())
 			}
@@ -421,34 +419,6 @@ func TestSetSpanAttributesOnStart(t *testing.T) {
 	}
 }
 
-func TestSetSpanAttributes(t *testing.T) {
-	te := NewTestExporter()
-	tp := NewTracerProvider(WithSyncer(te), WithResource(resource.Empty()))
-	span := startSpan(tp, "SpanAttribute")
-	span.SetAttributes(attribute.String("key1", "value1"))
-	got, err := endSpan(te, span)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	want := &snapshot{
-		spanContext: trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    tid,
-			TraceFlags: 0x1,
-		}),
-		parent: sc.WithRemote(true),
-		name:   "span0",
-		attributes: []attribute.KeyValue{
-			attribute.String("key1", "value1"),
-		},
-		spanKind:               trace.SpanKindInternal,
-		instrumentationLibrary: instrumentation.Library{Name: "SpanAttribute"},
-	}
-	if diff := cmpDiff(got, want); diff != "" {
-		t.Errorf("SetSpanAttributes: -got +want %s", diff)
-	}
-}
-
 func TestSamplerAttributesLocalChildSpan(t *testing.T) {
 	sampler := &testSampler{prefix: "span", t: t}
 	te := NewTestExporter()
@@ -471,72 +441,192 @@ func TestSamplerAttributesLocalChildSpan(t *testing.T) {
 	assert.Equal(t, []attribute.KeyValue{attribute.Int("callCount", 1)}, gotSpan1.Attributes())
 }
 
-func TestSetSpanAttributesOverLimit(t *testing.T) {
-	te := NewTestExporter()
-	tp := NewTracerProvider(WithSpanLimits(SpanLimits{AttributeCountLimit: 2}), WithSyncer(te), WithResource(resource.Empty()))
-
-	span := startSpan(tp, "SpanAttributesOverLimit")
-	span.SetAttributes(
-		attribute.Bool("key1", true),
+func TestSpanSetAttributes(t *testing.T) {
+	attrs := [...]attribute.KeyValue{
+		attribute.String("key1", "value1"),
 		attribute.String("key2", "value2"),
-		attribute.Bool("key1", false), // Replace key1.
-		attribute.Int64("key4", 4),    // Remove key2 and add key4
-	)
-	got, err := endSpan(te, span)
-	if err != nil {
-		t.Fatal(err)
+		attribute.String("key3", "value3"),
+		attribute.String("key4", "value4"),
+		attribute.String("key1", "value5"),
+		attribute.String("key2", "value6"),
+		attribute.String("key3", "value7"),
 	}
+	invalid := attribute.KeyValue{}
 
-	want := &snapshot{
-		spanContext: trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    tid,
-			TraceFlags: 0x1,
-		}),
-		parent: sc.WithRemote(true),
-		name:   "span0",
-		attributes: []attribute.KeyValue{
-			attribute.Bool("key1", false),
-			attribute.Int64("key4", 4),
+	tests := []struct {
+		name        string
+		input       [][]attribute.KeyValue
+		wantAttrs   []attribute.KeyValue
+		wantDropped int
+	}{
+		{
+			name:      "array",
+			input:     [][]attribute.KeyValue{attrs[:3]},
+			wantAttrs: attrs[:3],
 		},
-		spanKind:               trace.SpanKindInternal,
-		droppedAttributeCount:  1,
-		instrumentationLibrary: instrumentation.Library{Name: "SpanAttributesOverLimit"},
-	}
-	if diff := cmpDiff(got, want); diff != "" {
-		t.Errorf("SetSpanAttributesOverLimit: -got +want %s", diff)
-	}
-}
-
-func TestSetSpanAttributesWithInvalidKey(t *testing.T) {
-	te := NewTestExporter()
-	tp := NewTracerProvider(WithSpanLimits(SpanLimits{}), WithSyncer(te), WithResource(resource.Empty()))
-
-	span := startSpan(tp, "SpanToSetInvalidKeyOrValue")
-	span.SetAttributes(
-		attribute.Bool("", true),
-		attribute.Bool("key1", false),
-	)
-	got, err := endSpan(te, span)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	want := &snapshot{
-		spanContext: trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    tid,
-			TraceFlags: 0x1,
-		}),
-		parent: sc.WithRemote(true),
-		name:   "span0",
-		attributes: []attribute.KeyValue{
-			attribute.Bool("key1", false),
+		{
+			name:      "single_value:array",
+			input:     [][]attribute.KeyValue{attrs[:1], attrs[1:3]},
+			wantAttrs: attrs[:3],
 		},
-		spanKind:               trace.SpanKindInternal,
-		droppedAttributeCount:  0,
-		instrumentationLibrary: instrumentation.Library{Name: "SpanToSetInvalidKeyOrValue"},
+		{
+			name:      "array:single_value",
+			input:     [][]attribute.KeyValue{attrs[:2], attrs[2:3]},
+			wantAttrs: attrs[:3],
+		},
+		{
+			name:      "single_values",
+			input:     [][]attribute.KeyValue{attrs[:1], attrs[1:2], attrs[2:3]},
+			wantAttrs: attrs[:3],
+		},
+
+		// The tracing specification states:
+		//
+		//   For each unique attribute key, addition of which would result in
+		//   exceeding the limit, SDK MUST discard that key/value pair
+		//
+		// Therefore, adding attributes after the capacity is reached should
+		// result in those attributes being dropped.
+
+		{
+			name:        "drop_last_added",
+			input:       [][]attribute.KeyValue{attrs[:3], attrs[3:4], attrs[3:4]},
+			wantAttrs:   attrs[:3],
+			wantDropped: 2,
+		},
+
+		// The tracing specification states:
+		//
+		//   Setting an attribute with the same key as an existing attribute
+		//   SHOULD overwrite the existing attribute's value.
+		//
+		// Therefore, attributes are updated regardless of capacity state.
+
+		{
+			name:      "single_value_update",
+			input:     [][]attribute.KeyValue{attrs[:1], attrs[:3]},
+			wantAttrs: attrs[:3],
+		},
+		{
+			name:      "all_update",
+			input:     [][]attribute.KeyValue{attrs[:3], attrs[4:7]},
+			wantAttrs: attrs[4:7],
+		},
+		{
+			name:      "all_update/multi",
+			input:     [][]attribute.KeyValue{attrs[:3], attrs[4:7], attrs[:3]},
+			wantAttrs: attrs[:3],
+		},
+		{
+			name:      "deduplicate/under_capacity",
+			input:     [][]attribute.KeyValue{attrs[:1], attrs[:1], attrs[:1]},
+			wantAttrs: attrs[:1],
+		},
+		{
+			name:      "deduplicate/over_capacity",
+			input:     [][]attribute.KeyValue{attrs[:1], attrs[:1], attrs[:1], attrs[:3]},
+			wantAttrs: attrs[:3],
+		},
+		{
+			name: "deduplicate/added",
+			input: [][]attribute.KeyValue{
+				attrs[:2],
+				{attrs[2], attrs[2], attrs[2]},
+			},
+			wantAttrs: attrs[:3],
+		},
+		{
+			name: "deduplicate/added_at_cappacity",
+			input: [][]attribute.KeyValue{
+				attrs[:3],
+				{attrs[2], attrs[2], attrs[2]},
+			},
+			wantAttrs: attrs[:3],
+		},
+		{
+			name: "invalid",
+			input: [][]attribute.KeyValue{
+				{invalid},
+			},
+			wantDropped: 1,
+		},
+		{
+			name: "invalid_with_valid",
+			input: [][]attribute.KeyValue{
+				{invalid, attrs[0]},
+			},
+			wantAttrs:   attrs[:1],
+			wantDropped: 1,
+		},
+		{
+			name: "invalid_over_capacity",
+			input: [][]attribute.KeyValue{
+				{invalid, invalid, invalid, invalid, attrs[0]},
+			},
+			wantAttrs:   attrs[:1],
+			wantDropped: 4,
+		},
+		{
+			name: "valid:invalid/under_capacity",
+			input: [][]attribute.KeyValue{
+				attrs[:1],
+				{invalid},
+			},
+			wantAttrs:   attrs[:1],
+			wantDropped: 1,
+		},
+		{
+			name: "valid:invalid/over_capacity",
+			input: [][]attribute.KeyValue{
+				attrs[:1],
+				{invalid, invalid, invalid, invalid},
+			},
+			wantAttrs:   attrs[:1],
+			wantDropped: 4,
+		},
+		{
+			name: "valid_at_capacity:invalid",
+			input: [][]attribute.KeyValue{
+				attrs[:3],
+				{invalid, invalid, invalid, invalid},
+			},
+			wantAttrs:   attrs[:3],
+			wantDropped: 4,
+		},
 	}
-	if diff := cmpDiff(got, want); diff != "" {
-		t.Errorf("SetSpanAttributesWithInvalidKey: -got +want %s", diff)
+
+	const (
+		capacity = 3
+		instName = "TestSpanAttributeCapacity"
+		spanName = "test span"
+	)
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			te := NewTestExporter()
+			sl := NewSpanLimits()
+			sl.AttributeCountLimit = capacity
+			tp := NewTracerProvider(WithSyncer(te), WithSpanLimits(sl))
+			_, span := tp.Tracer(instName).Start(context.Background(), spanName)
+			for _, a := range test.input {
+				span.SetAttributes(a...)
+			}
+			span.End()
+
+			require.Implements(t, (*ReadOnlySpan)(nil), span)
+			roSpan := span.(ReadOnlySpan)
+
+			// Ensure the span itself is valid.
+			assert.ElementsMatch(t, test.wantAttrs, roSpan.Attributes(), "exected attributes")
+			assert.Equal(t, test.wantDropped, roSpan.DroppedAttributes(), "dropped attributes")
+
+			snap, ok := te.GetSpan(spanName)
+			require.Truef(t, ok, "span %s not exported", spanName)
+
+			// Ensure the exported span snapshot is valid.
+			assert.ElementsMatch(t, test.wantAttrs, snap.Attributes(), "exected attributes")
+			assert.Equal(t, test.wantDropped, snap.DroppedAttributes(), "dropped attributes")
+		})
 	}
 }
 
@@ -586,7 +676,9 @@ func TestEvents(t *testing.T) {
 
 func TestEventsOverLimit(t *testing.T) {
 	te := NewTestExporter()
-	tp := NewTracerProvider(WithSpanLimits(SpanLimits{EventCountLimit: 2}), WithSyncer(te), WithResource(resource.Empty()))
+	sl := NewSpanLimits()
+	sl.EventCountLimit = 2
+	tp := NewTracerProvider(WithSpanLimits(sl), WithSyncer(te), WithResource(resource.Empty()))
 
 	span := startSpan(tp, "EventsOverLimit")
 	k1v1 := attribute.String("key1", "value1")
@@ -670,6 +762,15 @@ func TestLinks(t *testing.T) {
 	if diff := cmpDiff(got, want); diff != "" {
 		t.Errorf("Link: -got +want %s", diff)
 	}
+	sc1 = trace.NewSpanContext(trace.SpanContextConfig{TraceID: trace.TraceID([16]byte{1, 1}), SpanID: trace.SpanID{3}})
+
+	span1 := startSpan(tp, "name", trace.WithLinks([]trace.Link{
+		{SpanContext: trace.SpanContext{}},
+		{SpanContext: sc1},
+	}...))
+
+	sdkspan, _ := span1.(*recordingSpan)
+	require.Len(t, sdkspan.Links(), 1)
 }
 
 func TestLinksOverLimit(t *testing.T) {
@@ -679,7 +780,9 @@ func TestLinksOverLimit(t *testing.T) {
 	sc2 := trace.NewSpanContext(trace.SpanContextConfig{TraceID: trace.TraceID([16]byte{1, 1}), SpanID: trace.SpanID{3}})
 	sc3 := trace.NewSpanContext(trace.SpanContextConfig{TraceID: trace.TraceID([16]byte{1, 1}), SpanID: trace.SpanID{3}})
 
-	tp := NewTracerProvider(WithSpanLimits(SpanLimits{LinkCountLimit: 2}), WithSyncer(te), WithResource(resource.Empty()))
+	sl := NewSpanLimits()
+	sl.LinkCountLimit = 2
+	tp := NewTracerProvider(WithSpanLimits(sl), WithSyncer(te), WithResource(resource.Empty()))
 
 	span := startSpan(tp, "LinksOverLimit",
 		trace.WithLinks(
@@ -806,7 +909,7 @@ func cmpDiff(x, y interface{}) string {
 // checkChild is test utility function that tests that c has fields set appropriately,
 // given that it is a child span of p.
 func checkChild(t *testing.T, p trace.SpanContext, apiSpan trace.Span) error {
-	s := apiSpan.(*span)
+	s := apiSpan.(*recordingSpan)
 	if s == nil {
 		return fmt.Errorf("got nil child span, want non-nil")
 	}
@@ -1016,58 +1119,39 @@ func TestChildSpanCount(t *testing.T) {
 }
 
 func TestNilSpanEnd(t *testing.T) {
-	var span *span
+	var span *recordingSpan
 	span.End()
 }
 
-func TestExecutionTracerTaskEnd(t *testing.T) {
-	var n uint64
+func TestNonRecordingSpanDoesNotTrackRuntimeTracerTask(t *testing.T) {
 	tp := NewTracerProvider(WithSampler(NeverSample()))
-	tr := tp.Tracer("Execution Tracer Task End")
+	tr := tp.Tracer("TestNonRecordingSpanDoesNotTrackRuntimeTracerTask")
 
+	_, apiSpan := tr.Start(context.Background(), "foo")
+	if _, ok := apiSpan.(runtimeTracer); ok {
+		t.Fatalf("non recording span implements runtime trace task tracking")
+	}
+}
+
+func TestRecordingSpanRuntimeTracerTaskEnd(t *testing.T) {
+	tp := NewTracerProvider(WithSampler(AlwaysSample()))
+	tr := tp.Tracer("TestRecordingSpanRuntimeTracerTaskEnd")
+
+	var n uint64
 	executionTracerTaskEnd := func() {
 		atomic.AddUint64(&n, 1)
 	}
-
-	var spans []*span
 	_, apiSpan := tr.Start(context.Background(), "foo")
-	s := apiSpan.(*span)
-
-	s.executionTracerTaskEnd = executionTracerTaskEnd
-	spans = append(spans, s) // never sample
-
-	tID, _ := trace.TraceIDFromHex("0102030405060708090a0b0c0d0e0f")
-	sID, _ := trace.SpanIDFromHex("0001020304050607")
-	ctx := context.Background()
-
-	ctx = trace.ContextWithRemoteSpanContext(ctx,
-		trace.NewSpanContext(trace.SpanContextConfig{
-			TraceID:    tID,
-			SpanID:     sID,
-			TraceFlags: 0,
-		}),
-	)
-	_, apiSpan = tr.Start(
-		ctx,
-		"foo",
-	)
-	s = apiSpan.(*span)
-	s.executionTracerTaskEnd = executionTracerTaskEnd
-	spans = append(spans, s) // parent not sampled
-
-	tp.sampler = AlwaysSample()
-	_, apiSpan = tr.Start(context.Background(), "foo")
-	s = apiSpan.(*span)
-	s.executionTracerTaskEnd = executionTracerTaskEnd
-	spans = append(spans, s) // always sample
-
-	for _, span := range spans {
-		span.End()
+	s, ok := apiSpan.(*recordingSpan)
+	if !ok {
+		t.Fatal("recording span not returned from always sampled Tracer")
 	}
-	// Only one span should be sampled meaning only one execution of
-	// executionTracerTaskEnd.
-	if got, want := n, uint64(1); got != want {
-		t.Fatalf("Execution tracer task ended for %v spans; want %v", got, want)
+
+	s.executionTracerTaskEnd = executionTracerTaskEnd
+	s.End()
+
+	if n != 1 {
+		t.Error("recording span did not end runtime trace task")
 	}
 }
 
@@ -1202,8 +1286,8 @@ func TestRecordErrorWithStackTrace(t *testing.T) {
 	assert.Equal(t, got.events[0].Attributes[1].Value.AsString(), want.events[0].Attributes[1].Value.AsString())
 	gotStackTraceFunctionName := strings.Split(got.events[0].Attributes[2].Value.AsString(), "\n")
 
-	assert.True(t, strings.HasPrefix(gotStackTraceFunctionName[1], "go.opentelemetry.io/otel/sdk/trace.recordStackTrace"))
-	assert.True(t, strings.HasPrefix(gotStackTraceFunctionName[3], "go.opentelemetry.io/otel/sdk/trace.(*span).RecordError"))
+	assert.Truef(t, strings.HasPrefix(gotStackTraceFunctionName[1], "go.opentelemetry.io/otel/sdk/trace.recordStackTrace"), "%q not prefixed with go.opentelemetry.io/otel/sdk/trace.recordStackTrace", gotStackTraceFunctionName[1])
+	assert.Truef(t, strings.HasPrefix(gotStackTraceFunctionName[3], "go.opentelemetry.io/otel/sdk/trace.(*recordingSpan).RecordError"), "%q not prefixed with go.opentelemetry.io/otel/sdk/trace.(*recordingSpan).RecordError", gotStackTraceFunctionName[3])
 }
 
 func TestRecordErrorNil(t *testing.T) {
@@ -1434,9 +1518,8 @@ func TestSpanCapturesPanicWithStackTrace(t *testing.T) {
 	assert.Equal(t, spans[0].Events()[0].Attributes[1].Value.AsString(), "error message")
 
 	gotStackTraceFunctionName := strings.Split(spans[0].Events()[0].Attributes[2].Value.AsString(), "\n")
-	fmt.Println(strings.Split(gotStackTraceFunctionName[1], "(0x")[0])
-	assert.True(t, strings.HasPrefix(gotStackTraceFunctionName[1], "go.opentelemetry.io/otel/sdk/trace.recordStackTrace"))
-	assert.True(t, strings.HasPrefix(gotStackTraceFunctionName[3], "go.opentelemetry.io/otel/sdk/trace.(*span).End"))
+	assert.Truef(t, strings.HasPrefix(gotStackTraceFunctionName[1], "go.opentelemetry.io/otel/sdk/trace.recordStackTrace"), "%q not prefixed with go.opentelemetry.io/otel/sdk/trace.recordStackTrace", gotStackTraceFunctionName[1])
+	assert.Truef(t, strings.HasPrefix(gotStackTraceFunctionName[3], "go.opentelemetry.io/otel/sdk/trace.(*recordingSpan).End"), "%q not prefixed with go.opentelemetry.io/otel/sdk/trace.(*recordingSpan).End", gotStackTraceFunctionName[3])
 }
 
 func TestReadOnlySpan(t *testing.T) {
@@ -1498,9 +1581,9 @@ func TestReadOnlySpan(t *testing.T) {
 
 	// Verify snapshot() returns snapshots that are independent from the
 	// original span and from one another.
-	d1 := s.(*span).snapshot()
+	d1 := s.(*recordingSpan).snapshot()
 	s.AddEvent("baz")
-	d2 := s.(*span).snapshot()
+	d2 := s.(*recordingSpan).snapshot()
 	for _, e := range d1.Events() {
 		if e.Name == "baz" {
 			t.Errorf("Didn't expect to find 'baz' event")
@@ -1557,8 +1640,10 @@ func TestReadWriteSpan(t *testing.T) {
 
 func TestAddEventsWithMoreAttributesThanLimit(t *testing.T) {
 	te := NewTestExporter()
+	sl := NewSpanLimits()
+	sl.AttributePerEventCountLimit = 2
 	tp := NewTracerProvider(
-		WithSpanLimits(SpanLimits{AttributePerEventCountLimit: 2}),
+		WithSpanLimits(sl),
 		WithSyncer(te),
 		WithResource(resource.Empty()),
 	)
@@ -1621,8 +1706,10 @@ func TestAddEventsWithMoreAttributesThanLimit(t *testing.T) {
 
 func TestAddLinksWithMoreAttributesThanLimit(t *testing.T) {
 	te := NewTestExporter()
+	sl := NewSpanLimits()
+	sl.AttributePerLinkCountLimit = 1
 	tp := NewTracerProvider(
-		WithSpanLimits(SpanLimits{AttributePerLinkCountLimit: 1}),
+		WithSpanLimits(sl),
 		WithSyncer(te),
 		WithResource(resource.Empty()),
 	)
@@ -1864,4 +1951,12 @@ func TestWithIDGenerator(t *testing.T) {
 		_, err = endSpan(te, span)
 		require.NoError(t, err)
 	}
+}
+
+func TestEmptyRecordingSpanAttributes(t *testing.T) {
+	assert.Nil(t, (&recordingSpan{}).Attributes())
+}
+
+func TestEmptyRecordingSpanDroppedAttributes(t *testing.T) {
+	assert.Equal(t, 0, (&recordingSpan{}).DroppedAttributes())
 }
